@@ -1,0 +1,26 @@
+# names:
+# - Boat
+# - Motorboat
+# - Miscboat
+# - Militaryship
+# - Passengership
+# - Seamark
+# - Sailboat
+# - Cruiseship
+# - Miscellaneous
+# - Cargoship
+# - Ferry
+# nc: 11
+# train: ../abo-ships-dataset/train/images/
+# val: ../abo-ships-dataset/valid/images/
+names:
+- boat
+- motorboat 
+- cruiseship 
+- seamark
+- sailboat
+- Ferry
+
+nc: 6
+train: ../testermix/train/images/
+val: ../testermix/valid/images/

@@ -22,6 +22,7 @@ import random
 import subprocess
 import sys
 import time
+import logging
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,9 @@ import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from torch.optim import lr_scheduler
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.utils.data
 from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
@@ -42,11 +46,14 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import val as validate  # for end-of-epoch mAP
 from models.experimental import attempt_load
-from models.yolo import Model
+# from models.yolo import Model
+from models.yolocustom import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.dataloaders import create_dataloader
+# from utils.dataloaders import create_dataloader
+from utils.dataloaderscustom import create_dataloader
+# from utils.facedataset import create_dataloader
 from utils.downloads import attempt_download, is_url
 from utils.general import (LOGGER, TQDM_BAR_FORMAT, check_amp, check_dataset, check_file, check_git_info,
                            check_git_status, check_img_size, check_requirements, check_suffix, check_yaml, colorstr,
@@ -57,7 +64,7 @@ from utils.loggers import Loggers
 from utils.loggers.comet.comet_utils import check_comet_resume
 from utils.loss import ComputeLoss
 from utils.metrics import fitness
-from utils.plots import plot_evolve
+from utils.plots import plot_evolve, plot_images, plot_labels, plot_results
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP, smart_optimizer,
                                smart_resume, torch_distributed_zero_first)
 
@@ -65,6 +72,8 @@ LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 GIT_INFO = check_git_info()
+
+
 
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
@@ -107,7 +116,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # Config
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != 'cpu'
-    init_seeds(opt.seed + 1 + RANK, deterministic=True)
+    # init_seeds(opt.seed + 1 + RANK, deterministic=True)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path = data_dict['train'], data_dict['val']
@@ -115,22 +124,40 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     names = {0: 'item'} if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
 
+    # # Model
+    # check_suffix(weights, '.pt')  # check weights
+    # pretrained = weights.endswith('.pt')
+    # if pretrained:
+    #     with torch_distributed_zero_first(LOCAL_RANK):
+    #         weights = attempt_download(weights)  # download if not found locally
+    #     ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+    #     model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+    #     exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
+    #     csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
+    #     csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
+    #     model.load_state_dict(csd, strict=False)  # load
+    #     LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
+    # else:
+    #     model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+    # amp = check_amp(model)  # check AMP
+
     # Model
-    check_suffix(weights, '.pt')  # check weights
     pretrained = weights.endswith('.pt')
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
-            weights = attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
-        csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
+            attempt_download(weights)  # download if not found locally
+        ckpt = torch.load(weights, map_location='cpu')  # load checkpoint
+        if hyp.get('anchors'):
+            ckpt['model'].yaml['anchors'] = round(hyp['anchors'])  # force autoanchor
+        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc).to(device)  # create
+        exclude = ['anchor'] if opt.cfg or hyp.get('anchors') else []  # exclude keys
+        csd = ckpt['model'].float().state_dict()  # to FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(csd, strict=False)  # load
-        LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
+        LOGGER.info('Transferred %g/%g items from %s' % (len(csd), len(model.state_dict()), weights))  # report
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-    amp = check_amp(model)  # check AMP
+        model = Model(cfg, ch=3, nc=nc).to(device)  # create
+
 
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
@@ -198,9 +225,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               workers=workers,
                                               image_weights=opt.image_weights,
                                               quad=opt.quad,
-                                              prefix=colorstr('train: '),
-                                              shuffle=True,
-                                              seed=opt.seed)
+                                              prefix=colorstr('train: '))
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
@@ -221,6 +246,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        prefix=colorstr('val: '))[0]
 
         if not resume:
+            labels = np.concatenate(dataset.labels, 0)
+            c = torch.tensor(labels[:, 0])  # classes
+
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
             model.half().float()  # pre-reduce anchor precision
@@ -236,9 +264,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     hyp['box'] *= 3 / nl  # scale to layers
     hyp['cls'] *= nc / 80 * 3 / nl  # scale to classes and layers
     hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
-    # hyp['label_smoothing'] = opt.label_smoothing
+    hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
+    model.gr = 1.0
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
@@ -277,9 +306,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        # logger.info(('\n' + '%10s' * 9) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'landmark', 'total', 'targets', 'img_size'))
-
-        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'landmark_loss', 'total', 'Instances', 'Size'))
+        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'obj_loss', 'cls_loss', 'kpt_loss', 'total_loss', 'Instances', 'Size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
@@ -348,7 +375,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK in {-1, 0}:
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
-            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
+            ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
                 results, maps, _ = validate.run(data_dict,
@@ -359,7 +386,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                 single_cls=single_cls,
                                                 dataloader=val_loader,
                                                 save_dir=save_dir,
-                                                plots=False,
+                                                plots=plots and final_epoch,
                                                 callbacks=callbacks,
                                                 compute_loss=compute_loss)
 
@@ -468,7 +495,7 @@ def parse_opt(known=False):
     parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
-    parser.add_argument('--seed', type=int, default=0, help='Global training seed')
+    # parser.add_argument('--seed', type=int, default=0, help='Global training seed')
     parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
 
     # Logger arguments
@@ -598,7 +625,6 @@ def main(opt, callbacks=Callbacks()):
                 # Mutate
                 mp, s = 0.8, 0.2  # mutation probability, sigma
                 npr = np.random
-                npr.seed(int(time.time()))
                 g = np.array([meta[k][0] for k in hyp.keys()])  # gains 0-1
                 ng = len(meta)
                 v = np.ones(ng)
