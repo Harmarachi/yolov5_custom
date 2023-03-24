@@ -5,6 +5,8 @@ Step to run.
 <details open>
 <summary>Install</summary>
 
+Recommended: Use a virtual environment to manage packages and avoid version conflicts.
+
 Clone repo and install [requirements.txt](https://github.com/ultralytics/yolov5/blob/master/requirements.txt) in a
 [**Python>=3.7.0**](https://www.python.org/) environment, including
 [**PyTorch>=1.7**](https://pytorch.org/get-started/locally/).
