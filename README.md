@@ -20,12 +20,13 @@ pip install -r requirements.txt  # install
 
 <details>
 <summary>Dataset</summary>
-Unzip the mini dataset 'testermix.zip' and move it to the parent directoryof this repo on your computer
+Unzip the mini dataset 'testermix.zip' and move it to the parent directory of this repo on your computer
 </details>
 
 <details>
 <summary>Training</summary>
-
+To replicate, run:
+  
 ```bash
 python traincustom.py --img 640 --batch 2 --epochs 3 --data dataset.yaml --weights yolov5s.pt
 ```
